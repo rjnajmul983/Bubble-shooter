@@ -5,74 +5,59 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
-env:
-  GODOT_VERSION: "4.3"
-  GODOT_RELEASE: "stable"
-  ANDROID_COMPILE_SDK: "35"
-  ANDROID_BUILD_TOOLS: "35.0.0"
-
 jobs:
   build-android-apk:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Extract uploaded ZIP automatically
-        run: |
-          ZIP_FILE=$(ls -1 *.zip | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "Error: No .zip file found in repository root!"
-            exit 1
-          fi
-          echo "Extracting: $ZIP_FILE"
-          mkdir -p game_src
-          unzip -q -o "$ZIP_FILE" -d game_src
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Patch level generator & run 500-level integrity tests
-        working-directory: game_src
-        run: |
-          python3 -c '
-          p = "tools/generate_levels.py"
-          s = open(p, encoding="utf-8").read()
-          s = s.replace("if sig in seen_hashes:", "if len(cand[\"grid\"]) < 28 or sig in seen_hashes:")
-          s = s.replace("max_shots=55", "max_shots=38")
-          s = s.replace("budget = max(12, min(42, shots_used + margin))", "budget = max(12, shots_used + margin)")
-          open(p, "w", encoding="utf-8").write(s)
-
-          t = "tools/run_tests.py"
-          ts = open(t, encoding="utf-8").read()
-          ts = ts.replace("res://([A-Za-z0-9_./-]+)", "res://([A-Za-z0-9_./%-]+)")
-          open(t, "w", encoding="utf-8").write(ts)
-          '
-          python3 tools/generate_levels.py
-          python3 tools/run_tests.py
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Install Android SDK Platform & Build Tools
+      - name: Extract ZIP, Patch & Verify 500 Levels
+        run: |
+          ZIP_FILE=$(ls -1 *.zip | head -n 1)
+          mkdir -p game_src
+          unzip -q -o "$ZIP_FILE" -d game_src
+          cd game_src
+          python3 -c '
+          p="tools/generate_levels.py"; s=open(p).read().replace("if sig in seen_hashes:","if len(cand[\"grid\"]) < 28 or sig in seen_hashes:").replace("max_shots=55","max_shots=38").replace("budget = max(12, min(42, shots_used + margin))","budget = max(12, shots_used + margin)"); open(p,"w").write(s)
+          t="tools/run_tests.py"; open(t,"w").write(open(t).read().replace("res://([A-Za-z0-9_./-]+)","res://([A-Za-z0-9_./%-]+)"))
+          '
+          python3 tools/generate_levels.py
+          python3 tools/run_tests.py
+
+      - name: Install Android SDK & Godot 4.3
         run: |
           SDKMANAGER=$(find "${ANDROID_HOME}/cmdline-tools" -name sdkmanager | head -n 1)
           yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" "platform-tools" "build-tools;${ANDROID_BUILD_TOOLS}" "platforms;android-${ANDROID_COMPILE_SDK}"
+          "$SDKMANAGER" "platform-tools" "build-tools;35.0.0" "platforms;android-35"
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.3.stable"
+          curl -sSL "https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip" -o g.zip
+          unzip -q g.zip && chmod +x Godot_v4.3-stable_linux.x86_64 && sudo mv Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot && rm g.zip
+          curl -sSL "https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz" -o t.tpz
+          unzip -q t.tpz -d tt && mv tt/templates/* "$HOME/.local/share/godot/export_templates/4.3.stable/" && rm -rf t.tpz tt
 
-      - name: Download & Install Godot 4.3 Headless + Export Templates
+      - name: Sign & Export Release APK
+        working-directory: game_src
         run: |
-          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}"
-          curl -sSL "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_RELEASE}/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64.zip" -o godot.zip
-          unzip -q godot.zip
-          chmod +x "Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64"
-          sudo mv "Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64" /usr/local/bin/godot
-          rm -f godot.zip
+          mkdir -p build "$HOME/.config/godot"
+          KS_PATH="$(pwd)/build/release.keystore"
+          keytool -genkey -v -keystore "$KS_PATH" -alias neonkey -keyalg RSA -keysize 2048 -validity 10000 -storepass neonpass123 -keypass neonpass123 -dname "CN=NeonBubbleSurge, OU=Dev, O=NeonGames, L=Dhaka, S=BD, C=BD"
+          printf '[gd_resource type="EditorSettings" format=3]\n[resource]\nexport/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\nexport/android/debug_keystore = "%s"\nexport/android/debug_keystore_user = "neonkey"\nexport/android/debug_keystore_pass = "neonpass123"\n' "${ANDROID_HOME}" "${JAVA_HOME}" "${KS_PATH}" > "$HOME/.config/godot/editor_settings-4.3.tres"
+          python3 -c 'import os; ks=os.path.abspath("build/release.keystore"); c=open("export_presets.cfg").read().replace("keystore/release=\"\"",f"keystore/release=\"{ks}\"").replace("keystore/release_user=\"\"","keystore/release_user=\"neonkey\"").replace("keystore/release_password=\"\"","keystore/release_password=\"neonpass123\"").replace("gradle_build/min_sdk=\"24\"","gradle_build/min_sdk=\"\"").replace("gradle_build/target_sdk=\"35\"","gradle_build/target_sdk=\"\""); open("export_presets.cfg","w").write(c)'
+          godot --headless --import --quit
+          godot --headless --export-release "Android" "build/NeonBubbleSurge-release.apk"
+          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify build/NeonBubbleSurge-release.apk
+          ls -lh build/NeonBubbleSurge-release.apk
 
-          curl -sSL "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_RELEASE}/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_export_templates.tpz" -o templates.tpz
+      - name: Upload Signed APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeonBubbleSurge-release-apk
+          path: game_src/build/NeonBubbleSurge-release.apk
+          retention-days: 30
