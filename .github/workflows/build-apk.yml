@@ -1,0 +1,148 @@
+name: Build Signed Android APK (From ZIP)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_RELEASE: "stable"
+  ANDROID_COMPILE_SDK: "35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract uploaded ZIP automatically
+        run: |
+          ZIP_FILE=$(ls -1 *.zip | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Error: No .zip file found in repository root!"
+            exit 1
+          fi
+          echo "Extracting: $ZIP_FILE"
+          mkdir -p game_src
+          unzip -q -o "$ZIP_FILE" -d game_src
+          ls -la game_src
+
+      - name: Set up Python & run automated game tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run project, asset & 500-level integrity tests
+        working-directory: game_src
+        run: python3 tools/run_tests.py
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform & Build Tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "build-tools;${ANDROID_BUILD_TOOLS}" "platforms;android-${ANDROID_COMPILE_SDK}"
+
+      - name: Download & Install Godot 4.3 Headless + Export Templates
+        run: |
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}"
+          curl -sSL "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_RELEASE}/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64.zip" -o godot.zip
+          unzip -q godot.zip
+          chmod +x "Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64"
+          sudo mv "Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64" /usr/local/bin/godot
+          rm -f godot.zip
+
+          curl -sSL "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_RELEASE}/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_export_templates.tpz" -o templates.tpz
+          unzip -q templates.tpz -d templates_tmp
+          mv templates_tmp/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}/"
+          rm -rf templates.tpz templates_tmp
+
+      - name: Prepare Release Keystore
+        id: keystore
+        working-directory: game_src
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          mkdir -p build
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > build/release.keystore
+            echo "alias=${KS_ALIAS:-neonkey}" >> $GITHUB_OUTPUT
+            echo "pass=${KS_PASS}" >> $GITHUB_OUTPUT
+          else
+            keytool -genkey -v \
+              -keystore build/release.keystore \
+              -alias neonkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass neonpass123 -keypass neonpass123 \
+              -dname "CN=NeonBubbleSurge, OU=GameDev, O=NeonGames, L=Dhaka, S=BD, C=BD"
+            echo "alias=neonkey" >> $GITHUB_OUTPUT
+            echo "pass=neonpass123" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure Godot Editor Settings & Keystore
+        working-directory: game_src
+        env:
+          KS_ALIAS: ${{ steps.keystore.outputs.alias }}
+          KS_PASS: ${{ steps.keystore.outputs.pass }}
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          KS_PATH="$(pwd)/build/release.keystore"
+          cat > "$HOME/.config/godot/editor_settings-4.3.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_HOME}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "${KS_PATH}"
+          export/android/debug_keystore_user = "${KS_ALIAS}"
+          export/android/debug_keystore_pass = "${KS_PASS}"
+          EOF
+
+          python3 -c '
+          import os
+          ks = os.path.abspath("build/release.keystore")
+          alias = os.environ["KS_ALIAS"]
+          pw = os.environ["KS_PASS"]
+          with open("export_presets.cfg", "r", encoding="utf-8") as f:
+              cfg = f.read()
+          cfg = cfg.replace("keystore/release=\"\"", f"keystore/release=\"{ks}\"")
+          cfg = cfg.replace("keystore/release_user=\"\"", f"keystore/release_user=\"{alias}\"")
+          cfg = cfg.replace("keystore/release_password=\"\"", f"keystore/release_password=\"{pw}\"")
+          with open("export_presets.cfg", "w", encoding="utf-8") as f:
+              f.write(cfg)
+          '
+
+      - name: Import Godot Project Assets
+        working-directory: game_src
+        run: godot --headless --import --quit
+
+      - name: Export Signed Release APK
+        working-directory: game_src
+        run: |
+          mkdir -p build
+          godot --headless --export-release "Android" "build/NeonBubbleSurge-release.apk"
+          ls -lh build/NeonBubbleSurge-release.apk
+
+      - name: Verify APK Signature
+        working-directory: game_src
+        run: |
+          "${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner" verify --verbose build/NeonBubbleSurge-release.apk
+
+      - name: Upload Signed APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeonBubbleSurge-release-apk
+          path: game_src/build/NeonBubbleSurge-release.apk
+          retention-days: 30
