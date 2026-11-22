@@ -20,7 +20,7 @@ jobs:
 
       - name: Extract ZIP, Patch & Verify 500 Levels
         run: |
-          ZIP_FILE=$(ls -1 *.zip | head -n 1)
+          ZIP_FILE=$(ls -1 *.zip | sort -V | tail -n 1)
           mkdir -p game_src
           unzip -q -o "$ZIP_FILE" -d game_src
           cd game_src
