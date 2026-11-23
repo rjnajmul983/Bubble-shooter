@@ -1,63 +1,230 @@
-name: Build Signed Android APK (From ZIP)
+name: Build Neon Bubble Surge APK from ZIP
 
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-zip-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: '4.3'
+  GODOT_RELEASE: 'stable'
+  ANDROID_BUILD_TOOLS: '35.0.0'
 
 jobs:
-  build-android-apk:
-    runs-on: ubuntu-latest
+  android-apk:
+    name: Extract ZIP and build Android APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out uploaded ZIP
+        uses: actions/checkout@v4
+
+      - name: Extract the ZIP automatically
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob nocaseglob
+          zip_files=("$GITHUB_WORKSPACE"/*.zip)
+          if [ "${#zip_files[@]}" -ne 1 ]; then
+            echo 'ERROR: Upload exactly ONE source ZIP to the repository root.' >&2
+            printf 'ZIP files found: %s\n' "${#zip_files[@]}" >&2
+            exit 1
+          fi
+          ZIP_FILE="${zip_files[0]}"
+          echo "Found ZIP: $(basename "$ZIP_FILE")"
+          unzip -tq "$ZIP_FILE" > /dev/null
+
+          EXTRACT_DIR="$RUNNER_TEMP/neon-game-src"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+          mapfile -d '' projects < <(find "$EXTRACT_DIR" -maxdepth 5 -type f -name project.godot -print0)
+          if [ "${#projects[@]}" -ne 1 ]; then
+            echo 'ERROR: ZIP must contain exactly one Godot project.godot file.' >&2
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "${projects[0]}")"
+          test -f "$PROJECT_DIR/export_presets.cfg" || { echo 'Missing export_presets.cfg' >&2; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Godot project located at: $PROJECT_DIR"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - uses: actions/setup-java@v4
+          python-version: '3.11'
+
+      - name: Validate 500 levels and project assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          if [ -f tools/run_tests.py ]; then
+            python3 tools/run_tests.py
+          else
+            python3 -m json.tool data/levels.json > /dev/null
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: temurin
+          java-version: '17'
 
-      - name: Extract ZIP, Patch & Verify 500 Levels
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
         run: |
-          ZIP_FILE=$(ls -1 *.zip | sort -V | tail -n 1)
-          mkdir -p game_src
-          unzip -q -o "$ZIP_FILE" -d game_src
-          cd game_src
-          python3 -c '
-          p="tools/generate_levels.py"; s=open(p).read().replace("if sig in seen_hashes:","if len(cand[\"grid\"]) < 28 or sig in seen_hashes:").replace("max_shots=55","max_shots=38").replace("budget = max(12, min(42, shots_used + margin))","budget = max(12, shots_used + margin)"); open(p,"w").write(s)
-          t="tools/run_tests.py"; open(t,"w").write(open(t).read().replace("res://([A-Za-z0-9_./-]+)","res://([A-Za-z0-9_./%-]+)"))
-          '
-          python3 tools/generate_levels.py
-          python3 tools/run_tests.py
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-34' \
+            'platforms;android-35' \
+            'build-tools;34.0.0' \
+            'build-tools;35.0.0' \
+            'cmdline-tools;latest'
 
-      - name: Install Android SDK & Godot 4.3
+      - name: Download Godot 4.3 and Android export templates
+        shell: bash
         run: |
-          SDKMANAGER=$(find "${ANDROID_HOME}/cmdline-tools" -name sdkmanager | head -n 1)
-          yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" "platform-tools" "build-tools;35.0.0" "platforms;android-35"
-          mkdir -p "$HOME/.local/share/godot/export_templates/4.3.stable"
-          curl -sSL "https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip" -o g.zip
-          unzip -q g.zip && chmod +x Godot_v4.3-stable_linux.x86_64 && sudo mv Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot && rm g.zip
-          curl -sSL "https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz" -o t.tpz
-          unzip -q t.tpz -d tt && mv tt/templates/* "$HOME/.local/share/godot/export_templates/4.3.stable/" && rm -rf t.tpz tt
+          set -euo pipefail
+          TMP_GODOT="$RUNNER_TEMP/godot-setup"
+          mkdir -p "$TMP_GODOT" "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}"
+          BASE_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_RELEASE}"
 
-      - name: Sign & Export Release APK
-        working-directory: game_src
+          curl --fail --location --retry 3 \
+            "$BASE_URL/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64.zip" \
+            --output "$TMP_GODOT/godot.zip"
+          unzip -q "$TMP_GODOT/godot.zip" -d "$TMP_GODOT"
+          sudo install -m 755 "$TMP_GODOT/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_linux.x86_64" /usr/local/bin/godot
+
+          curl --fail --location --retry 3 \
+            "$BASE_URL/Godot_v${GODOT_VERSION}-${GODOT_RELEASE}_export_templates.tpz" \
+            --output "$TMP_GODOT/templates.tpz"
+          unzip -q "$TMP_GODOT/templates.tpz" -d "$TMP_GODOT/export"
+          cp -a "$TMP_GODOT/export/templates/." \
+            "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}/"
+          godot --headless --version
+
+      - name: Create Android signing key
+        shell: bash
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SIGNING_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          mkdir -p build "$HOME/.config/godot"
-          KS_PATH="$(pwd)/build/release.keystore"
-          keytool -genkey -v -keystore "$KS_PATH" -alias neonkey -keyalg RSA -keysize 2048 -validity 10000 -storepass neonpass123 -keypass neonpass123 -dname "CN=NeonBubbleSurge, OU=Dev, O=NeonGames, L=Dhaka, S=BD, C=BD"
-          printf '[gd_resource type="EditorSettings" format=3]\n[resource]\nexport/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\nexport/android/debug_keystore = "%s"\nexport/android/debug_keystore_user = "neonkey"\nexport/android/debug_keystore_pass = "neonpass123"\n' "${ANDROID_HOME}" "${JAVA_HOME}" "${KS_PATH}" > "$HOME/.config/godot/editor_settings-4.3.tres"
-          python3 -c 'import os; ks=os.path.abspath("build/release.keystore"); c=open("export_presets.cfg").read().replace("keystore/release=\"\"",f"keystore/release=\"{ks}\"").replace("keystore/release_user=\"\"","keystore/release_user=\"neonkey\"").replace("keystore/release_password=\"\"","keystore/release_password=\"neonpass123\"").replace("gradle_build/min_sdk=\"24\"","gradle_build/min_sdk=\"\"").replace("gradle_build/target_sdk=\"35\"","gradle_build/target_sdk=\"\""); open("export_presets.cfg","w").write(c)'
-          godot --headless --import --quit
-          godot --headless --export-release "Android" "build/NeonBubbleSurge-release.apk"
-          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify build/NeonBubbleSurge-release.apk
-          ls -lh build/NeonBubbleSurge-release.apk
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/neon-signing"
+          KS_FILE="$RUNNER_TEMP/neon-signing/release.keystore"
+          if [ -n "$SIGNING_KEYSTORE_B64" ]; then
+            if [ -z "$SIGNING_PASSWORD" ] || [ -z "$SIGNING_ALIAS" ]; then
+              echo 'Both KEYSTORE_PASSWORD and KEY_ALIAS secrets are required with ANDROID_KEYSTORE_BASE64.' >&2
+              exit 1
+            fi
+            echo "$SIGNING_KEYSTORE_B64" | base64 --decode > "$KS_FILE"
+            KS_ALIAS="$SIGNING_ALIAS"
+            KS_PASS="$SIGNING_PASSWORD"
+            KS_KEY_PASS="${SIGNING_KEY_PASSWORD:-$SIGNING_PASSWORD}"
+            echo 'Using the reusable signing keystore from GitHub Secrets.'
+          else
+            KS_ALIAS='neonbubble'
+            KS_PASS='neonbubble_temp_pass_2026'
+            KS_KEY_PASS="$KS_PASS"
+            keytool -genkeypair -noprompt \
+              -keystore "$KS_FILE" \
+              -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$KS_PASS" -keypass "$KS_KEY_PASS" \
+              -dname 'CN=Neon Bubble Surge, OU=Game, O=Neon, L=Dhaka, C=BD'
+            echo 'Using a temporary signing key (reinstall may be needed for future APKs).'
+          fi
+          echo "::add-mask::$KS_PASS"
+          echo "::add-mask::$KS_KEY_PASS"
+          {
+            echo "KS_FILE=$KS_FILE"
+            echo "KS_ALIAS=$KS_ALIAS"
+            echo "KS_PASS=$KS_PASS"
+            echo "KS_KEY_PASS=$KS_KEY_PASS"
+          } >> "$GITHUB_ENV"
 
-      - name: Upload Signed APK Artifact
+      - name: Configure Godot Android export
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.config/godot"
+          cat > "$HOME/.config/godot/editor_settings-4.3.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_HOME}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "${KS_FILE}"
+          export/android/debug_keystore_user = "${KS_ALIAS}"
+          export/android/debug_keystore_pass = "${KS_PASS}"
+          EOF
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          preset = Path(os.environ['PROJECT_DIR']) / 'export_presets.cfg'
+          config = preset.read_text(encoding='utf-8')
+          if 'name="Android"' not in config:
+              raise RuntimeError('An Android export preset named Android is required.')
+          for key, value in {
+              'keystore/release': os.environ['KS_FILE'],
+              'keystore/release_user': os.environ['KS_ALIAS'],
+              'keystore/release_password': os.environ['KS_PASS'],
+          }.items():
+              config, count = re.subn(r'(?m)^' + re.escape(key) + r'=.*$',
+                                      lambda _: key + '="' + value + '"', config)
+              if count != 1:
+                  raise RuntimeError('Missing or duplicate Android export setting: ' + key)
+          preset.write_text(config, encoding='utf-8')
+          print('Android export preset configured.')
+          PY
+
+      - name: Import assets and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 300s godot --headless --path "$PROJECT_DIR" --editor --import
+
+      - name: Export release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          godot --headless --path "$PROJECT_DIR" \
+            --export-release 'Android' \
+            "$GITHUB_WORKSPACE/apk-output/NeonBubbleSurge-v1.1.apk"
+          test -s "$GITHUB_WORKSPACE/apk-output/NeonBubbleSurge-v1.1.apk"
+          ls -lh "$GITHUB_WORKSPACE/apk-output/NeonBubbleSurge-v1.1.apk"
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" \
+            verify --verbose \
+            "$GITHUB_WORKSPACE/apk-output/NeonBubbleSurge-v1.1.apk"
+
+      - name: Upload APK to GitHub Actions Artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: NeonBubbleSurge-release-apk
-          path: game_src/build/NeonBubbleSurge-release.apk
+          name: NeonBubbleSurge-v1.1-Android-APK
+          path: apk-output/NeonBubbleSurge-v1.1.apk
+          if-no-files-found: error
           retention-days: 30
