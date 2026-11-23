@@ -24,7 +24,7 @@ jobs:
   android-apk:
     name: Extract ZIP and build Android APK
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Check out uploaded ZIP
@@ -80,8 +80,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # v3 requests the discontinued Android SDK "tools" package and fails.
+      - name: Set up Android SDK (fixed deprecated tools package)
+        uses: android-actions/setup-android@v4.0.4
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android SDK packages
         shell: bash
