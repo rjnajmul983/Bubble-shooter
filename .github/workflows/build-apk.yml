@@ -18,6 +18,7 @@ env:
   GODOT_VERSION: '4.3'
   GODOT_RELEASE: 'stable'
   ANDROID_BUILD_TOOLS: '35.0.0'
+  SOURCE_ZIP: 'Neon_Bubble_Surge_v1.1_Fair_Challenge_Source.zip'
 
 jobs:
   android-apk:
@@ -33,15 +34,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob nocaseglob
-          zip_files=("$GITHUB_WORKSPACE"/*.zip)
-          if [ "${#zip_files[@]}" -ne 1 ]; then
-            echo 'ERROR: Upload exactly ONE source ZIP to the repository root.' >&2
-            printf 'ZIP files found: %s\n' "${#zip_files[@]}" >&2
+          ZIP_FILE="$GITHUB_WORKSPACE/$SOURCE_ZIP"
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: Source ZIP not found: $SOURCE_ZIP" >&2
+            echo 'ZIP files currently in the repository root:' >&2
+            find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' >&2
             exit 1
           fi
-          ZIP_FILE="${zip_files[0]}"
-          echo "Found ZIP: $(basename "$ZIP_FILE")"
+          echo "Using source ZIP: $SOURCE_ZIP (other ZIP files will be ignored)"
           unzip -tq "$ZIP_FILE" > /dev/null
 
           EXTRACT_DIR="$RUNNER_TEMP/neon-game-src"
