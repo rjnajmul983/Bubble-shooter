@@ -162,7 +162,7 @@ jobs:
             echo "KS_KEY_PASS=$KS_KEY_PASS"
           } >> "$GITHUB_ENV"
 
-      - name: Configure Godot Android export
+      - name: Configure Godot Android export (SDK override fix)
         shell: bash
         run: |
           set -euo pipefail
@@ -194,8 +194,18 @@ jobs:
                                       lambda _: key + '="' + value + '"', config)
               if count != 1:
                   raise RuntimeError('Missing or duplicate Android export setting: ' + key)
+          # Godot 4.3 prebuilt Android APK export cannot override min/target
+          # SDK values. Keep the template's supported defaults (target API 34).
+          for key in ('gradle_build/min_sdk', 'gradle_build/target_sdk'):
+              config, count = re.subn(
+                  r'(?m)^' + re.escape(key) + r'=.*$',
+                  lambda _: key + '=""',
+                  config,
+              )
+              if count != 1:
+                  raise RuntimeError('Missing or duplicate Android SDK option: ' + key)
           preset.write_text(config, encoding='utf-8')
-          print('Android export preset configured.')
+          print('Android export preset configured with non-Gradle SDK defaults.')
           PY
 
       - name: Import assets and scripts
